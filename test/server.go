@@ -52,9 +52,9 @@ func monitor() {
 		if loopCount%10 == 0 {
 			index := 0
 			fmt.Println("Show detailed connection information:")
-			for k, c := range tcpConnInfoMap {
+			for _, c := range tcpConnInfoMap {
 				index++
-				fmt.Printf("%d.\traddr[%s],recvCount[%d],recvBytes[%d].\r\n", index, k, atomic.LoadInt64(&c.recvCount), atomic.LoadInt64(&c.recvBytes))
+				fmt.Printf("%d.\trecvCount[%d],recvBytes[%d].\r\n", index, atomic.LoadInt64(&c.recvCount), atomic.LoadInt64(&c.recvBytes))
 			}
 			fmt.Println("-------------------------------------")
 		}

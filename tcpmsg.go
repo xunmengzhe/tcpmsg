@@ -150,24 +150,28 @@ type TcpMsgErrorHandler func(conn *TcpMsgConn, err error)
 
 const keepaliveInterval time.Duration = time.Minute            //客户端用的
 const keepaliveTimeoutInterval time.Duration = time.Minute * 5 //服务端用的
+const aliveCheckInterval time.Duration = time.Minute           //服务端用的，该值必须小于keepaliveTimeoutInterval的值
+const aliveCheckFastInterval time.Duration = time.Second * 30  //服务端用的
 
 type TcpMsgConn struct {
-	conn              *net.TCPConn
-	refCnt            int64
-	sendCnt           uint64
-	sendBytes         uint64
-	sendRealBytes     uint64
-	sendErrCnt        uint64
-	recvCnt           uint64
-	recvBytes         uint64
-	recvRealBytes     uint64
-	recvErrCnt        uint64
-	recvHandler       TcpMsgReceiveHandler
-	errHandler        TcpMsgErrorHandler
-	exiting           bool
-	timerKeepalive    *time.Timer         //客户端用的
-	waitItemKeepalive *waitqueue.WaitItem //服务端用的
-	server            *TcpMsgServer       //服务端用的
+	conn                     *net.TCPConn
+	refCnt                   int64
+	sendCnt                  uint64
+	sendBytes                uint64
+	sendRealBytes            uint64
+	sendErrCnt               uint64
+	recvCnt                  uint64
+	recvBytes                uint64
+	recvRealBytes            uint64
+	recvErrCnt               uint64
+	recvHandler              TcpMsgReceiveHandler
+	errHandler               TcpMsgErrorHandler
+	exiting                  bool
+	timerKeepalive           *time.Timer         //客户端用的
+	waitItemKeepaliveTimeout *waitqueue.WaitItem //服务端用的
+	waitItemAliveCheck       *waitqueue.WaitItem //服务端用的
+	alive                    bool                //服务端用的
+	server                   *TcpMsgServer       //服务端用的
 }
 
 func newTcpMsgConn(conn *net.TCPConn, recvHandler TcpMsgReceiveHandler, errHandler TcpMsgErrorHandler) *TcpMsgConn {
@@ -205,6 +209,11 @@ func NewTcpMsgClient(serverHost string, recvHandler TcpMsgReceiveHandler, errHan
 func keepaliveTimeout(data interface{}) {
 	conn := data.(*TcpMsgConn)
 	conn.keepaliveTimeout()
+}
+
+func aliveCheck(data interface{}) {
+	conn := data.(*TcpMsgConn)
+	conn.aliveCheck()
 }
 
 func (c *TcpMsgConn) Close() {
@@ -263,12 +272,39 @@ func (c *TcpMsgConn) keepaliveReset() {
 	c.timerKeepalive.Reset(keepaliveInterval)
 }
 
+func (c *TcpMsgConn) aliveCheck() {
+	if !c.get() {
+		return
+	}
+	defer c.put()
+	if c.alive {
+		c.setAliveCheck(aliveCheckInterval)
+		c.keepaliveTimeoutReset()
+	} else {
+		c.setAliveCheck(aliveCheckFastInterval)
+	}
+}
+
+func (c *TcpMsgConn) setAliveCheck(timeout time.Duration) {
+	if !c.get() {
+		return
+	}
+	defer c.put()
+	if c.server != nil {
+		c.server.keepaliveWaitqueue.Add(c, timeout, aliveCheck)
+		c.alive = false
+	}
+}
+
 func (c *TcpMsgConn) keepaliveTimeout() {
 	c.Close()
 }
 
 func (c *TcpMsgConn) keepaliveTimeoutReset() {
-	c.waitItemKeepalive.Reset(keepaliveTimeoutInterval)
+	err := c.waitItemKeepaliveTimeout.Reset(keepaliveTimeoutInterval)
+	if err != nil {
+		fmt.Println("waitItemKeepaliveTimeout reset failed. errstr[", err.Error(), "].")
+	}
 }
 
 func (c *TcpMsgConn) receiver() {
@@ -366,6 +402,7 @@ func (c *TcpMsgConn) handleMsg(msg *msghdr) {
 		fmt.Printf("Unpacket msg failed. errstr[%s].", err.Error())
 		return
 	}
+	c.alive = true //Set alive
 	if msg.cmd == CmdData && c.recvHandler != nil {
 		c.recvHandler(c, msg.data)
 	}
@@ -473,7 +510,8 @@ func (s *TcpMsgServer) put() {
 			c.server = nil //必须要在c.Close()之前将c.server设置为nil。避免造成死锁。
 			c.Close()
 			delete(s.cliConn, c.conn.RemoteAddr().String())
-			c.waitItemKeepalive.Remove()
+			c.waitItemKeepaliveTimeout.Remove()
+			c.waitItemAliveCheck.Remove()
 		}
 		s.lock.Unlock()
 		//s.listener.Close() //此处不用Close，因为在accept方法退出的时候会调用Close。
@@ -485,11 +523,18 @@ func (s *TcpMsgServer) addConn(conn *TcpMsgConn) error {
 	s.lock.Lock()
 	defer s.lock.Unlock()
 	s.cliConn[conn.conn.RemoteAddr().String()] = conn
-	wi, err := s.keepaliveWaitqueue.Add(conn, keepaliveTimeoutInterval, keepaliveTimeout)
+	wiTimeout, err := s.keepaliveWaitqueue.Add(conn, keepaliveTimeoutInterval, keepaliveTimeout)
 	if err != nil {
 		return err
 	}
-	conn.waitItemKeepalive = wi
+	conn.waitItemKeepaliveTimeout = wiTimeout
+	wiAliveCheck, err := s.keepaliveWaitqueue.Add(conn, aliveCheckInterval, aliveCheck)
+	if err != nil {
+		wiTimeout.Remove()
+		conn.waitItemKeepaliveTimeout = nil
+		return err
+	}
+	conn.waitItemAliveCheck = wiAliveCheck
 	return nil
 }
 
@@ -501,7 +546,8 @@ func (s *TcpMsgServer) removeConn(conn *TcpMsgConn) {
 	s.lock.Lock()
 	defer s.lock.Unlock()
 	delete(s.cliConn, conn.conn.RemoteAddr().String())
-	conn.waitItemKeepalive.Remove()
+	conn.waitItemKeepaliveTimeout.Remove()
+	conn.waitItemAliveCheck.Remove()
 }
 
 func (s *TcpMsgServer) accept() {
@@ -518,6 +564,7 @@ func (s *TcpMsgServer) accept() {
 		}
 		tcpMsgConn := newTcpMsgConn(conn, s.recvHandler, s.errHandler)
 		tcpMsgConn.server = s
+		tcpMsgConn.alive = false
 		err := s.addConn(tcpMsgConn)
 		if err != nil {
 			fmt.Println("addConn failed. ", err.Error())
